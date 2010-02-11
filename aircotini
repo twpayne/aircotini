@@ -31,10 +31,6 @@ import os
 import re
 from select import select
 import stat
-try:
-    from cStringIO import StringIO
-except ImportError:
-    from StringIO import StringIO
 import sys
 import tty
 
