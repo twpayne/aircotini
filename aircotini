@@ -1,0 +1,206 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+#    aircotini - download tracklogs from Aircotec flight recorders
+#    Copyright (C) 2010  Tom Payne
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# FIXME check self.dt
+# FIXME generate output filename
+# FIXME handle two's complement in lat/lng
+# FIXME handle negative UTC offsets
+# FIXME time wrap-around
+# FIXME IGC output
+
+
+from datetime import datetime, timedelta
+from optparse import OptionParser
+import os
+import re
+from select import select
+import stat
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from StringIO import StringIO
+import sys
+import tty
+
+
+HEADER_RE = re.compile(r"""
+        @                              # Kennung
+        TN                             # 'TOP-NAVIGATOR'
+        ([0-7])                        # Polare '0'..'7'
+        .                              # reserved
+        (?P<serial_number>[0-9A-F]{4}) # TN S/N (HEX)
+        (?P<software_version>[0-9]{2}) # SW-Version
+        ..                             # reserved
+        ([0-9A-F]{2})                  # If. Barogramm-Nr. (HEX)
+        (?P<dt>[0-9]{10})              # FLugdatuM (BCD), Takeoff-Zeit (BCD)
+        ([0-9]{4})                     # Lande-Zeit (BCD)
+        (?P<utc_offset>[0-9]{2})       # LokalZeit (BCD)
+        (?P<takeoff_location>.{11})    # Takeoff-location (ASCII)
+        ([0-9A-F]{4})                  # delta_Höhe_QNH (m) (HEX)
+        ([0-9A-F]{4})                  # Takeoff-Höhe (m) (HEX)
+        ([0-9A-F]{4})                  # Lande-Höhe (m) (HEX)
+        ([0-9A-F]{4})                  # Maximal-Höhe (m) (HEX)
+        ([0-9A-F]{4})                  # max. Höhengewinn (m) (HEX)
+        ([0-9A-F]{4})                  # Summe aller Höhenqewinne (m) (HEX)
+        ([0-9A-F]{2})                  # | max. Steigen | (0.1 m/s) (HEX) + 4.7m/s
+        ([0-9A-F]{2})                  # | max. Sinken | (0.1 m/s) (HEX) - 3.5m/s
+        ..                             # reserved
+        ([0-9A-F]{2})                  # max. TAS (0.5 km/h) (HEX)
+        ([0-9A-F]{4})                  # Distanz zwischen Takeoff und Landung (0.1 km) (HEX) oder Dreieck zw. TPT
+        \r\n""", re.VERBOSE)
+
+ZEIT_WIND_MACREADY_RE = re.compile(r"""
+        (?P<time>[0-9]{6}) # Beginnzeit (lokal) des folgenden 30s - Flugdatenblocks (BCD)
+        ([0-9]{2})         # Windgeschwindigkeit (0.5 km/h) (HEX)
+        ([0-9]{2})         # Windrichtung (2°) (HEX)
+        ([0-9])            # MCready (0.5 m/s) (BCD)
+        AC                 # AIRCOTEC
+        .                  # reserved
+        \r\n""", re.VERBOSE)
+
+FLUGDATEN_RE = re.compile(r"""
+        (?P<lat>[0-9A-F]{6}) # Latitude (0.01') von GPS (HEX)
+        (?P<lng>[0-9A-F]{6}) # Longitude (0.01') von GPS (HEX)
+        (?P<ele>[0-9A-F]{4}) # Altitude (m) (HEX)
+        ([0-9A-F]{2})        # | vario | (0.1 m/s), SIGN im Flag 1) (HEX>
+        ([0-9A-F]{2})        # True Air Speed (0.5 km/h) (HEX)
+        ([0-9A-F]{2})        # Speed over Ground von GPS (HEX)
+        ([0-9A-F]{2})        # Course over Ground (2°) (HEX)
+        ([0-9A-F]{3})        # Temperatur (0.1 K absolut) (HEX)
+        ..                   # reserved
+        ([0-9A-F])           # FLAG 1)
+        \r\n""", re.VERBOSE)
+
+EOF_RE = re.compile(r'@EOF\r\n')
+
+GPX_TIME_FORMAT = '%Y-%m-%dZ%H:%M:%SZ'
+
+
+class Coord(object):
+
+    def __init__(self, dt, lat, lng, ele):
+        self.dt = dt
+        self.lat = lat
+        self.lng = lng
+        self.ele = ele
+
+
+def aircotec(device, timeout):
+    fd = os.open(device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        if stat.S_ISCHR(os.fstat(fd).st_mode):
+            tty.setraw(fd)
+            attr = tty.tcgetattr(fd)
+            attr[tty.ISPEED] = attr[tty.OSPEED] = tty.B9600
+            tty.tcsetattr(fd)
+        buffer = ''
+        while True:
+            index = buffer.find('\n')
+            if index == -1:
+                if select([fd], [], [], timeout) == ([], [], []):
+                    raise RuntimeError('timeout waiting for data')
+                buffer += os.read(fd, 1024)
+            else:
+                yield buffer[:index + 1]
+                buffer = buffer[index + 1:]
+    finally:
+        os.close(fd)
+
+
+def parse_itude(s):
+    return int(s, 16) / 6000.0
+
+
+class TNC(object):
+
+    def __init__(self, lines):
+        line = lines.next()
+        d = HEADER_RE.match(line).groupdict()
+        self.serial_number = int(d['serial_number'], 16)
+        self.dt = datetime.strptime(d['dt'], '%y%m%d%H%M%S')
+        self.utc_offset = timedelta(seconds=60 * int(d['utc_offset']))
+        self.takeoff_location = d['takeoff_location'].rstrip()
+        self.coords = []
+        t = self.dt
+        for line in lines:
+            m = FLUGDATEN_RE.match(line)
+            if m:
+                d = m.groupdict()
+                coord = Coord(t, parse_itude(d['lat']), parse_itude(d['lng']), int(d['ele'], 16))
+                self.coords.append(coord)
+                t += timedelta(seconds=1)
+                continue
+            m = ZEIT_WIND_MACREADY_RE.match(line)
+            if m:
+                d = m.groupdict()
+                t = datetime.strptime(d['time'], '%H%M%S')
+                t = self.dt.replace(hour=t.hour, minute=t.minute, second=t.second) - self.utc_offset
+                continue
+            m = EOF_RE.match(line)
+            if m:
+                break
+            raise RuntimeError(repr(line))
+
+    def basename(self):
+        return '%s-%d' % (self.dt.strftime(GPX_TIME_FORMAT), self.serial_number)
+
+    def gpx(self, file):
+        file.write('<?xml version="1.0" encoding="utf-8"?>\n')
+        file.write('<gpx version="1.0" creator="http://github.com/twpayne/aircotini">\n')
+        file.write('\t<metadata>\n')
+        file.write('\t\t<name>%s</name>\n' % self.basename())
+        file.write('\t\t<desc>%s</desc>\n' % self.takeoff_location)
+        file.write('\t\t<time>%s</time>\n' % self.dt.strftime(GPX_TIME_FORMAT))
+        file.write('\t</metadata>\n')
+        file.write('\t<trk>\n')
+        file.write('\t\t<trkseg>\n')
+        for coord in self.coords:
+            file.write('\t\t\t<trkpt lat="%f" lon="%f">\n' % (coord.lat, coord.lng))
+            file.write('\t\t\t\t<ele>%d</ele>\n' % coord.ele)
+            file.write('\t\t\t\t<time>%s</time>\n' % coord.dt.strftime(GPX_TIME_FORMAT))
+            file.write('\t\t\t</trkpt>\n')
+        file.write('\t\t</trkseg>\n')
+        file.write('\t</trk>\n')
+        file.write('</gpx>\n')
+
+
+def main(argv):
+    parser = OptionParser()
+    parser.add_option('--device', '-d', default='/dev/ttyS0', type=str)
+    parser.add_option('--timeout', '-t', default=60, type=int)
+    parser.add_option('--format', '-f', default='tnc', type='choice', choices='gpx tnc'.split())
+    parser.add_option('--output-filename', '-o', type=str)
+    options, args = parser.parse_args(argv[1:])
+    if options.output_filename is None:
+        file = open(tnc.basename() + '.' + options.format, 'w')
+    elif options.output_filename == '-':
+        file = sys.stdout
+    else:
+        file = open(options.output_filename, 'w')
+    if options.format == 'tnc':
+        for line in aircotec(options.device, options.timeout):
+            file.write(line)
+            if EOF_RE.match(line):
+                break
+    elif options.format == 'gpx':
+        TNC(aircotec(options.device, options.timeout)).gpx(file)
+
+
+if __name__ == '__main__':
+    main(sys.argv)
